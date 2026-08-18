@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MIDI to JSON Converter (ESP32-S3)</title>
+    <!-- MIDI 파싱을 위한 외부 라이브러리 로드 -->
+    <script src="https://cdn.jsdelivr.net/npm/@tonejs/midi"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f4f7f6;
+            color: #333;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .container {
+            background-color: #fff;
+            padding: 40px;
+            border-radius: 12px;
+            box-shadow: 0 8px 16px rgba(0,0,0,0.1);
+            text-align: center;
+            width: 100%;
+            max-width: 400px;
+        }
+        h1 { font-size: 24px; margin-bottom: 10px; color: #2c3e50; }
+        p { color: #7f8c8d; font-size: 14px; margin-bottom: 30px; }
+        
+        .upload-btn-wrapper {
+            position: relative;
+            overflow: hidden;
+            display: inline-block;
+            width: 100%;
+        }
+        .btn {
+            border: 2px dashed #3498db;
+            color: #3498db;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: bold;
+            width: 100%;
+            box-sizing: border-box;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .upload-btn-wrapper:hover .btn {
+            background-color: #f0f8ff;
+            border-color: #2980b9;
+            color: #2980b9;
+        }
+        .upload-btn-wrapper input[type=file] {
+            font-size: 100px;
+            position: absolute;
+            left: 0;
+            top: 0;
+            opacity: 0;
+            cursor: pointer;
+            height: 100%;
+        }
+        #status {
+            margin-top: 20px;
+            font-weight: bold;
+            font-size: 14px;
+            min-height: 20px;
+        }
+        .success { color: #27ae60; }
+        .error { color: #e74c3c; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>🎹 MIDI to JSON 변환기</h1>
+    <p>MIDI 파일을 선택하면 변환된 JSON 파일이 즉시 다운로드됩니다.<br>(SD 카드의 json_files 폴더에 넣어주세요)</p>
+    
+    <div class="upload-btn-wrapper">
+        <button class="btn">MIDI 파일 선택하기</button>
+        <input type="file" id="midiInput" accept=".mid,.midi" />
+    </div>
+
+    <div id="status"></div>
+</div>
+
+<script>
+    document.getElementById('midiInput').addEventListener('change', function(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const statusDiv = document.getElementById('status');
+        statusDiv.textContent = "⏳ 분석 중: " + file.name + "...";
+        statusDiv.className = "";
+
+        const reader = new FileReader();
+        reader.onload = function(event) {
+            try {
+                // 1. MIDI 파일 읽기
+                const midi = new Midi(event.target.result);
+                const title = file.name.replace(/\.[^/.]+$/, "");
+                
+                // BPM 추출 (첫 번째 템포 기준, 없으면 120)
+                const bpm = midi.header.tempos.length > 0 ? Math.round(midi.header.tempos[0].bpm) : 120;
+
+                // 2. 트랙(양손) 분석 (드럼 제외)
+                let validTracks = midi.tracks.filter(t => t.notes.length > 0 && !t.instrument.percussion);
+                let trackAnalysis = [];
+
+                validTracks.forEach(track => {
+                    let totalPitch = track.notes.reduce((sum, note) => sum + note.midi, 0);
+                    let avgPitch = totalPitch / track.notes.length;
+                    trackAnalysis.push({ track: track, avg: avgPitch });
+                });
+
+                const isMultiTrack = trackAnalysis.length >= 2;
+                let rightHandTrack = null;
+                if (isMultiTrack) {
+                    trackAnalysis.sort((a, b) => b.avg - a.avg);
+                    rightHandTrack = trackAnalysis[0].track; // 평균 음이 가장 높은 트랙이 오른손
+                }
+
+                // 3. 타임라인 딕셔너리 생성
+                let timelineMap = new Map();
+
+                const addEvent = (time, pitch, hand) => {
+                    let t = Math.round(time * 1000) / 1000; // 소수점 3자리 반올림
+                    if (!timelineMap.has(t)) {
+                        timelineMap.set(t, []);
+                    }
+                    timelineMap.get(t).push({ p: pitch, h: hand });
+                };
+
+                validTracks.forEach(track => {
+                    track.notes.forEach(note => {
+                        let hand = "r";
+                        if (isMultiTrack) {
+                            hand = (track === rightHandTrack) ? "r" : "l";
+                        } else {
+                            hand = (note.midi >= 60) ? "r" : "l";
+                        }
+
+                        // LED ON 이벤트 (+)
+                        addEvent(note.time, note.midi, hand);
+                        // LED OFF 이벤트 (-)
+                        addEvent(note.time + note.duration, -note.midi, hand);
+                    });
+                });
+
+                // 4. 시간순 정렬 및 최종 JSON 구조화
+                let sortedTimes = Array.from(timelineMap.keys()).sort((a, b) => a - b);
+                let timelineList = sortedTimes.map(t => {
+                    return { t: t, n: timelineMap.get(t) };
+                });
+
+                // 마지막 노트의 시간을 기준으로 총 마디(Total Measures) 계산 (ESP32 부담 줄이기)
+                let lastTime = sortedTimes.length > 0 ? sortedTimes[sortedTimes.length - 1] : 0;
+                let totalMeasures = Math.floor(lastTime / (4.0 * (60.0 / bpm))) + 1;
+
+                const jsonStructure = {
+                    metadata: {
+                        title: title,
+                        bpm: bpm,
+                        total_measures: totalMeasures
+                    },
+                    timeline: timelineList
+                };
+
+                // 5. JSON 파일 다운로드 트리거
+                const jsonString = JSON.stringify(jsonStructure); // 용량 최적화 (공백 없음)
+                const blob = new Blob([jsonString], { type: "application/json" });
+                const url = URL.createObjectURL(blob);
+                
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = title + ".json";
+                document.body.appendChild(a);
+                a.click();
+                
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+
+                statusDiv.textContent = "✨ 변환 완료: " + title + ".json";
+                statusDiv.className = "success";
+
+            } catch (err) {
+                console.error(err);
+                statusDiv.textContent = "❌ 변환 중 에러 발생: 지원하지 않는 형식입니다.";
+                statusDiv.className = "error";
+            }
+            
+            // 동일한 파일을 다시 선택할 수 있도록 input 초기화
+            document.getElementById('midiInput').value = "";
+        };
+        reader.readAsArrayBuffer(file);
+    });
+</script>
+
+</body>
+</html>
